@@ -14,6 +14,8 @@ using SteamKit2;
 namespace RandomBotFriends;
 
 #pragma warning disable CA1812 // ASF uses this class during runtime
+#pragma warning disable CA1001 // Plugin instances live for the process' lifetime; ASF gives IPlugin implementations no disposal hook to call into
+#pragma warning disable CA5394 // Randomness here only picks arbitrary friend targets/order, it's not used for anything security-sensitive
 [UsedImplicitly]
 internal sealed class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	private const byte DefaultMinFriends = 2;
@@ -172,4 +174,6 @@ internal sealed class RandomBotFriends : IASF, IGitHubPluginUpdates {
 		return friends;
 	}
 }
+#pragma warning restore CA5394 // Randomness here only picks arbitrary friend targets/order, it's not used for anything security-sensitive
+#pragma warning restore CA1001 // Plugin instances live for the process' lifetime; ASF gives IPlugin implementations no disposal hook to call into
 #pragma warning restore CA1812 // ASF uses this class during runtime
