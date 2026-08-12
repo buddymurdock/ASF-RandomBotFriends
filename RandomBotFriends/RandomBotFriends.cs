@@ -16,14 +16,15 @@ namespace RandomBotFriends;
 #pragma warning disable CA1812 // ASF uses this class during runtime
 [UsedImplicitly]
 internal sealed class RandomBotFriends : IASF, IGitHubPluginUpdates {
-	private const byte DefaultMinFriends = 20;
-	private const byte DefaultMaxFriends = 50;
+	private const byte DefaultMinFriends = 2;
+	private const byte DefaultMaxFriends = 5;
 	private const ushort DefaultDelayBetweenInvitesInSeconds = 60;
 
 	// Random per-bot target friend count, picked once between MinFriends and MaxFriends and reused for the lifetime of the process
 	private readonly ConcurrentDictionary<string, int> BotFriendTargets = new(StringComparer.Ordinal);
 
 	private CancellationTokenSource? BackgroundLoopCts;
+	private volatile bool CapacityWarningLogged;
 	private ushort DelayBetweenInvitesInSeconds = DefaultDelayBetweenInvitesInSeconds;
 	private bool Enabled;
 	private byte MaxFriends = DefaultMaxFriends;
@@ -70,6 +71,11 @@ internal sealed class RandomBotFriends : IASF, IGitHubPluginUpdates {
 
 		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, will keep every bot's friend count between {MinFriends} and {MaxFriends}, with {DelayBetweenInvitesInSeconds}s between invites.");
 
+		if (BackgroundLoopCts != null) {
+			// OnASFInit() should only ever be called once per process, this is just a safety net against a possible double start
+			return Task.CompletedTask;
+		}
+
 		BackgroundLoopCts = new CancellationTokenSource();
 
 		Utilities.InBackground(() => BackgroundLoopAsync(BackgroundLoopCts.Token), true);
@@ -115,12 +121,18 @@ internal sealed class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			return;
 		}
 
+		if (!CapacityWarningLogged && (MinFriends > bots.Count - 1)) {
+			CapacityWarningLogged = true;
+
+			ASF.ArchiLogger.LogGenericWarning($"{nameof(RandomBotFriends)}MinFriends ({MinFriends}) is higher than the number of other bots available in this ASF instance ({bots.Count - 1}); some bots may never reach their target.");
+		}
+
 		List<Bot> onlineBots = [.. bots.Values.Where(static bot => bot.IsConnectedAndLoggedOn).OrderBy(static _ => Random.Shared.Next())];
 
 		foreach (Bot bot in onlineBots) {
 			int target = BotFriendTargets.GetOrAdd(bot.BotName, _ => MinFriends == MaxFriends ? MinFriends : Random.Shared.Next(MinFriends, MaxFriends + 1));
 
-			int currentFriends = bot.SteamFriends.GetFriendCount();
+			int currentFriends = GetActualFriendCount(bot);
 
 			if (currentFriends >= target) {
 				continue;
@@ -142,6 +154,22 @@ internal sealed class RandomBotFriends : IASF, IGitHubPluginUpdates {
 
 			return;
 		}
+	}
+
+	// SteamFriends.GetFriendCount() returns the size of the whole friend-list cache (pending, blocked, ignored, etc, not just accepted friends), so we need to filter it down ourselves
+	private static int GetActualFriendCount(Bot bot) {
+		int cacheSize = bot.SteamFriends.GetFriendCount();
+		int friends = 0;
+
+		for (int i = 0; i < cacheSize; i++) {
+			SteamID steamID = bot.SteamFriends.GetFriendByIndex(i);
+
+			if (bot.SteamFriends.GetFriendRelationship(steamID) == EFriendRelationship.Friend) {
+				friends++;
+			}
+		}
+
+		return friends;
 	}
 }
 #pragma warning restore CA1812 // ASF uses this class during runtime
