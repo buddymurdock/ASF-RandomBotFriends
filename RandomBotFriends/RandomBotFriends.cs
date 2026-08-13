@@ -25,7 +25,8 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	private const ulong IndividualAccountIDBase = 76561197960265728UL;
 
 	private const byte DefaultCommentsToScan = 50;
-	private const ushort DefaultDelayBetweenInvitesInSeconds = 60;
+	private const ushort DefaultMaxDelayBetweenInvitesInSeconds = 90;
+	private const ushort DefaultMinDelayBetweenInvitesInSeconds = 30;
 	private const byte DefaultGroupCommentersMaxFriends = 3;
 	private const byte DefaultGroupCommentersMinFriends = 1;
 	private const byte DefaultOwnBotsMaxFriends = 5;
@@ -39,7 +40,6 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	private CancellationTokenSource? BackgroundLoopCts;
 	private volatile bool CapacityWarningLogged;
 	private byte CommentsToScan = DefaultCommentsToScan;
-	private ushort DelayBetweenInvitesInSeconds = DefaultDelayBetweenInvitesInSeconds;
 	private bool Enabled;
 	private byte GroupCommentersMaxFriends = DefaultGroupCommentersMaxFriends;
 	private byte GroupCommentersMinFriends = DefaultGroupCommentersMinFriends;
@@ -49,6 +49,8 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 
 	private bool InviteGroupCommenters;
 	private bool InviteOwnBots = true;
+	private ushort MaxDelayBetweenInvitesInSeconds = DefaultMaxDelayBetweenInvitesInSeconds;
+	private ushort MinDelayBetweenInvitesInSeconds = DefaultMinDelayBetweenInvitesInSeconds;
 	private byte OwnBotsMaxFriends = DefaultOwnBotsMaxFriends;
 	private byte OwnBotsMinFriends = DefaultOwnBotsMinFriends;
 
@@ -56,8 +58,8 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	public string RepositoryName => "buddymurdock/ASF-RandomBotFriends";
 	public Version Version => typeof(RandomBotFriends).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
-	// Reads RandomBotFriendsEnabled / RandomBotFriendsDelayBetweenInvites / RandomBotFriendsInviteOwnBots / RandomBotFriendsOwnBotsMinFriends / RandomBotFriendsOwnBotsMaxFriends /
-	// RandomBotFriendsInviteGroupCommenters / RandomBotFriendsGroupCommentersMinFriends / RandomBotFriendsGroupCommentersMaxFriends / RandomBotFriendsCommentsToScan from the global ASF.json config
+	// Reads RandomBotFriendsEnabled / RandomBotFriendsMinDelayBetweenInvites / RandomBotFriendsMaxDelayBetweenInvites / RandomBotFriendsInviteOwnBots / RandomBotFriendsOwnBotsMinFriends /
+	// RandomBotFriendsOwnBotsMaxFriends / RandomBotFriendsInviteGroupCommenters / RandomBotFriendsGroupCommentersMinFriends / RandomBotFriendsGroupCommentersMaxFriends / RandomBotFriendsCommentsToScan from the global ASF.json config
 	public Task OnASFInit(IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
 		if (additionalConfigProperties != null) {
 			foreach ((string configProperty, JsonElement configValue) in additionalConfigProperties) {
@@ -66,8 +68,12 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 						Enabled = configValue.GetBoolean();
 
 						break;
-					case $"{nameof(RandomBotFriends)}DelayBetweenInvites" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort delayBetweenInvites) && (delayBetweenInvites > 0):
-						DelayBetweenInvitesInSeconds = delayBetweenInvites;
+					case $"{nameof(RandomBotFriends)}MinDelayBetweenInvites" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort minDelayBetweenInvites) && (minDelayBetweenInvites > 0):
+						MinDelayBetweenInvitesInSeconds = minDelayBetweenInvites;
+
+						break;
+					case $"{nameof(RandomBotFriends)}MaxDelayBetweenInvites" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetUInt16(out ushort maxDelayBetweenInvites) && (maxDelayBetweenInvites > 0):
+						MaxDelayBetweenInvitesInSeconds = maxDelayBetweenInvites;
 
 						break;
 					case $"{nameof(RandomBotFriends)}InviteOwnBots" when configValue.ValueKind is JsonValueKind.True or JsonValueKind.False:
@@ -102,6 +108,10 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			}
 		}
 
+		if (MinDelayBetweenInvitesInSeconds > MaxDelayBetweenInvitesInSeconds) {
+			(MinDelayBetweenInvitesInSeconds, MaxDelayBetweenInvitesInSeconds) = (MaxDelayBetweenInvitesInSeconds, MinDelayBetweenInvitesInSeconds);
+		}
+
 		if (OwnBotsMinFriends > OwnBotsMaxFriends) {
 			(OwnBotsMinFriends, OwnBotsMaxFriends) = (OwnBotsMaxFriends, OwnBotsMinFriends);
 		}
@@ -126,7 +136,7 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			return Task.CompletedTask;
 		}
 
-		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, {DelayBetweenInvitesInSeconds}s between invites. Sources: {(InviteOwnBots ? $"own bots ({OwnBotsMinFriends}-{OwnBotsMaxFriends} friends/bot)" : null)}{((InviteOwnBots && InviteGroupCommenters) ? " + " : null)}{(InviteGroupCommenters ? $"group commenters ({GroupCommentersMinFriends}-{GroupCommentersMaxFriends} friends/bot, last {CommentsToScan} comments)" : null)}.");
+		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, {MinDelayBetweenInvitesInSeconds}-{MaxDelayBetweenInvitesInSeconds}s between invites. Sources: {(InviteOwnBots ? $"own bots ({OwnBotsMinFriends}-{OwnBotsMaxFriends} friends/bot)" : null)}{((InviteOwnBots && InviteGroupCommenters) ? " + " : null)}{(InviteGroupCommenters ? $"group commenters ({GroupCommentersMinFriends}-{GroupCommentersMaxFriends} friends/bot, last {CommentsToScan} comments)" : null)}.");
 
 		if (BackgroundLoopCts != null) {
 			// OnASFInit() should only ever be called once per process, this is just a safety net against a possible double start
@@ -146,19 +156,15 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 		return Task.CompletedTask;
 	}
 
+	// Delay is re-rolled every tick within [MinDelayBetweenInvitesInSeconds; MaxDelayBetweenInvitesInSeconds] instead of using a fixed-period PeriodicTimer -
+	// a perfectly metronomic tick interval running around the clock is itself a machine-detectable pattern, independent of anything visible to other users
 	private async Task BackgroundLoopAsync(CancellationToken cancellationToken) {
-		using PeriodicTimer timer = new(TimeSpan.FromSeconds(DelayBetweenInvitesInSeconds));
-
 		while (!cancellationToken.IsCancellationRequested) {
-			bool shouldContinue;
+			int delaySeconds = MinDelayBetweenInvitesInSeconds == MaxDelayBetweenInvitesInSeconds ? MinDelayBetweenInvitesInSeconds : Random.Shared.Next(MinDelayBetweenInvitesInSeconds, MaxDelayBetweenInvitesInSeconds + 1);
 
 			try {
-				shouldContinue = await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false);
+				await Task.Delay(TimeSpan.FromSeconds(delaySeconds), cancellationToken).ConfigureAwait(false);
 			} catch (OperationCanceledException) {
-				break;
-			}
-
-			if (!shouldContinue) {
 				break;
 			}
 
