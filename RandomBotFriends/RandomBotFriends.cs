@@ -167,6 +167,28 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 		// At most one steamcommunity.com fetch per tick, regardless of how many bots we end up checking below
 		bool groupCommentersAttempted = false;
 
+		(ulong SteamID, string SourceLabel)? TryOwnBotsCandidate(Bot inviter) {
+			if (!InviteOwnBots) {
+				return null;
+			}
+
+			Bot? ownBotCandidate = PickOwnBotCandidate(inviter, onlineBots);
+
+			return ownBotCandidate != null ? (ownBotCandidate.SteamID, "own bot") : null;
+		}
+
+		async Task<(ulong SteamID, string SourceLabel)?> TryGroupCommentersCandidateAsync(Bot inviter) {
+			if (!InviteGroupCommenters || groupCommentersAttempted) {
+				return null;
+			}
+
+			groupCommentersAttempted = true;
+
+			ulong? commenterCandidate = await GetGroupCommenterCandidateAsync(inviter, bots).ConfigureAwait(false);
+
+			return commenterCandidate != null ? (commenterCandidate.Value, "group commenter") : null;
+		}
+
 		foreach (Bot bot in onlineBots) {
 			int target = BotFriendTargets.GetOrAdd(bot.BotName, _ => MinFriends == MaxFriends ? MinFriends : Random.Shared.Next(MinFriends, MaxFriends + 1));
 
@@ -178,35 +200,20 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 				continue;
 			}
 
-			(ulong CandidateSteamID, string SourceLabel)? candidate = null;
+			(ulong CandidateSteamID, string SourceLabel)? candidate;
 
-			foreach (bool isOwnBotsSource in ShuffledSourceTags()) {
-				if (isOwnBotsSource) {
-					if (!InviteOwnBots) {
-						continue;
-					}
+			// Randomize which enabled source gets tried first, falling back to the other one if the first found nothing
+			if (Random.Shared.Next(2) == 0) {
+				candidate = TryOwnBotsCandidate(bot);
 
-					Bot? ownBotCandidate = PickOwnBotCandidate(bot, onlineBots);
+				if (candidate == null) {
+					candidate = await TryGroupCommentersCandidateAsync(bot).ConfigureAwait(false);
+				}
+			} else {
+				candidate = await TryGroupCommentersCandidateAsync(bot).ConfigureAwait(false);
 
-					if (ownBotCandidate != null) {
-						candidate = (ownBotCandidate.SteamID, "own bot");
-
-						break;
-					}
-				} else {
-					if (!InviteGroupCommenters || groupCommentersAttempted) {
-						continue;
-					}
-
-					groupCommentersAttempted = true;
-
-					ulong? commenterCandidate = await GetGroupCommenterCandidateAsync(bot, bots).ConfigureAwait(false);
-
-					if (commenterCandidate != null) {
-						candidate = (commenterCandidate.Value, "group commenter");
-
-						break;
-					}
+				if (candidate == null) {
+					candidate = TryOwnBotsCandidate(bot);
 				}
 			}
 
@@ -225,9 +232,6 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			return;
 		}
 	}
-
-	// true = try the own-bots source, false = try the group-commenters source; these are fixed source tags, shuffled independently of which sources are actually enabled (checked by the caller)
-	private static IEnumerable<bool> ShuffledSourceTags() => new[] { true, false }.OrderBy(static _ => Random.Shared.Next());
 
 	private static Bot? PickOwnBotCandidate(Bot bot, List<Bot> onlineBots) => onlineBots.FirstOrDefault(otherBot => (otherBot != bot) && (otherBot.SteamID != 0) && (bot.SteamFriends.GetFriendRelationship(otherBot.SteamID) == EFriendRelationship.None));
 
