@@ -38,6 +38,10 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	private byte CommentsToScan = DefaultCommentsToScan;
 	private ushort DelayBetweenInvitesInSeconds = DefaultDelayBetweenInvitesInSeconds;
 	private bool Enabled;
+
+	// At most one steamcommunity.com fetch per tick, regardless of how many bots TrySendSingleInviteAsync ends up checking; reset at the start of every tick
+	private bool GroupCommentersAttemptedThisTick;
+
 	private bool InviteGroupCommenters;
 	private bool InviteOwnBots = true;
 	private byte MaxFriends = DefaultMaxFriends;
@@ -164,30 +168,7 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 
 		List<Bot> onlineBots = [.. bots.Values.Where(static bot => bot.IsConnectedAndLoggedOn).OrderBy(static _ => Random.Shared.Next())];
 
-		// At most one steamcommunity.com fetch per tick, regardless of how many bots we end up checking below
-		bool groupCommentersAttempted = false;
-
-		(ulong SteamID, string SourceLabel)? TryOwnBotsCandidate(Bot inviter) {
-			if (!InviteOwnBots) {
-				return null;
-			}
-
-			Bot? ownBotCandidate = PickOwnBotCandidate(inviter, onlineBots);
-
-			return ownBotCandidate != null ? (ownBotCandidate.SteamID, "own bot") : null;
-		}
-
-		async Task<(ulong SteamID, string SourceLabel)?> TryGroupCommentersCandidateAsync(Bot inviter) {
-			if (!InviteGroupCommenters || groupCommentersAttempted) {
-				return null;
-			}
-
-			groupCommentersAttempted = true;
-
-			ulong? commenterCandidate = await GetGroupCommenterCandidateAsync(inviter, bots).ConfigureAwait(false);
-
-			return commenterCandidate != null ? (commenterCandidate.Value, "group commenter") : null;
-		}
+		GroupCommentersAttemptedThisTick = false;
 
 		foreach (Bot bot in onlineBots) {
 			int target = BotFriendTargets.GetOrAdd(bot.BotName, _ => MinFriends == MaxFriends ? MinFriends : Random.Shared.Next(MinFriends, MaxFriends + 1));
@@ -204,16 +185,16 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 
 			// Randomize which enabled source gets tried first, falling back to the other one if the first found nothing
 			if (Random.Shared.Next(2) == 0) {
-				candidate = TryOwnBotsCandidate(bot);
+				candidate = TryOwnBotsCandidate(bot, onlineBots);
 
 				if (candidate == null) {
-					candidate = await TryGroupCommentersCandidateAsync(bot).ConfigureAwait(false);
+					candidate = await TryGroupCommentersCandidateAsync(bot, bots).ConfigureAwait(false);
 				}
 			} else {
-				candidate = await TryGroupCommentersCandidateAsync(bot).ConfigureAwait(false);
+				candidate = await TryGroupCommentersCandidateAsync(bot, bots).ConfigureAwait(false);
 
 				if (candidate == null) {
-					candidate = TryOwnBotsCandidate(bot);
+					candidate = TryOwnBotsCandidate(bot, onlineBots);
 				}
 			}
 
@@ -234,6 +215,28 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	}
 
 	private static Bot? PickOwnBotCandidate(Bot bot, List<Bot> onlineBots) => onlineBots.FirstOrDefault(otherBot => (otherBot != bot) && (otherBot.SteamID != 0) && (bot.SteamFriends.GetFriendRelationship(otherBot.SteamID) == EFriendRelationship.None));
+
+	private (ulong SteamID, string SourceLabel)? TryOwnBotsCandidate(Bot bot, List<Bot> onlineBots) {
+		if (!InviteOwnBots) {
+			return null;
+		}
+
+		Bot? ownBotCandidate = PickOwnBotCandidate(bot, onlineBots);
+
+		return ownBotCandidate != null ? (ownBotCandidate.SteamID, "own bot") : null;
+	}
+
+	private async Task<(ulong SteamID, string SourceLabel)?> TryGroupCommentersCandidateAsync(Bot bot, IReadOnlyDictionary<string, Bot> bots) {
+		if (!InviteGroupCommenters || GroupCommentersAttemptedThisTick) {
+			return null;
+		}
+
+		GroupCommentersAttemptedThisTick = true;
+
+		ulong? commenterCandidate = await GetGroupCommenterCandidateAsync(bot, bots).ConfigureAwait(false);
+
+		return commenterCandidate != null ? (commenterCandidate.Value, "group commenter") : null;
+	}
 
 	// Picks a random group the bot is already a member of, pulls its most recent CommentsToScan wall comments, and returns a random commenter the bot isn't already related to
 	private async Task<ulong?> GetGroupCommenterCandidateAsync(Bot bot, IReadOnlyDictionary<string, Bot> bots) {
