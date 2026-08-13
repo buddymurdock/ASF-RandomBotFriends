@@ -164,16 +164,51 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 
 		List<Bot> onlineBots = [.. bots.Values.Where(static bot => bot.IsConnectedAndLoggedOn).OrderBy(static _ => Random.Shared.Next())];
 
+		// At most one steamcommunity.com fetch per tick, regardless of how many bots we end up checking below
+		bool groupCommentersAttempted = false;
+
 		foreach (Bot bot in onlineBots) {
 			int target = BotFriendTargets.GetOrAdd(bot.BotName, _ => MinFriends == MaxFriends ? MinFriends : Random.Shared.Next(MinFriends, MaxFriends + 1));
 
-			int currentFriends = GetActualFriendCount(bot);
+			// Counts Friend (accepted) and RequestInitiator (our own outstanding invite) alike, so already-sent-but-not-yet-accepted invites still occupy a slot towards the target
+			// Without this, a target that real strangers never accept would never fill up, and this bot would keep sending unsolicited invites forever
+			int occupiedSlots = GetOccupiedFriendSlots(bot);
 
-			if (currentFriends >= target) {
+			if (occupiedSlots >= target) {
 				continue;
 			}
 
-			(ulong CandidateSteamID, string SourceLabel)? candidate = await GetCandidateAsync(bot, bots, onlineBots).ConfigureAwait(false);
+			(ulong CandidateSteamID, string SourceLabel)? candidate = null;
+
+			foreach (bool isOwnBotsSource in ShuffledSourceTags()) {
+				if (isOwnBotsSource) {
+					if (!InviteOwnBots) {
+						continue;
+					}
+
+					Bot? ownBotCandidate = PickOwnBotCandidate(bot, onlineBots);
+
+					if (ownBotCandidate != null) {
+						candidate = (ownBotCandidate.SteamID, "own bot");
+
+						break;
+					}
+				} else {
+					if (!InviteGroupCommenters || groupCommentersAttempted) {
+						continue;
+					}
+
+					groupCommentersAttempted = true;
+
+					ulong? commenterCandidate = await GetGroupCommenterCandidateAsync(bot, bots).ConfigureAwait(false);
+
+					if (commenterCandidate != null) {
+						candidate = (commenterCandidate.Value, "group commenter");
+
+						break;
+					}
+				}
+			}
 
 			if (candidate == null) {
 				continue;
@@ -182,7 +217,7 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			bool success = await bot.ArchiHandler.AddFriend(candidate.Value.CandidateSteamID).ConfigureAwait(false);
 
 			if (success) {
-				bot.ArchiLogger.LogGenericInfo($"Sent a random friend invite to {candidate.Value.CandidateSteamID} ({candidate.Value.SourceLabel}) ({currentFriends + 1}/{target}).");
+				bot.ArchiLogger.LogGenericInfo($"Sent a random friend invite to {candidate.Value.CandidateSteamID} ({candidate.Value.SourceLabel}) ({occupiedSlots + 1}/{target}).");
 			} else {
 				bot.ArchiLogger.LogGenericWarning($"Failed to send a friend invite to {candidate.Value.CandidateSteamID} ({candidate.Value.SourceLabel}).");
 			}
@@ -191,37 +226,8 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 		}
 	}
 
-	// Tries whichever candidate sources are enabled, in random order, and returns the first hit
-	private async Task<(ulong SteamID, string SourceLabel)?> GetCandidateAsync(Bot bot, IReadOnlyDictionary<string, Bot> bots, List<Bot> onlineBots) {
-		// true = try the own-bots source, false = try the group-commenters source; these are fixed source tags, shuffled independently of which sources are actually enabled (checked below)
-		List<bool> sources = [.. new[] { true, false }.OrderBy(static _ => Random.Shared.Next())];
-
-		foreach (bool isOwnBotsSource in sources) {
-			if (isOwnBotsSource) {
-				if (!InviteOwnBots) {
-					continue;
-				}
-
-				Bot? candidate = PickOwnBotCandidate(bot, onlineBots);
-
-				if (candidate != null) {
-					return (candidate.SteamID, "own bot");
-				}
-			} else {
-				if (!InviteGroupCommenters) {
-					continue;
-				}
-
-				ulong? candidateSteamID = await GetGroupCommenterCandidateAsync(bot, bots).ConfigureAwait(false);
-
-				if (candidateSteamID != null) {
-					return (candidateSteamID.Value, "group commenter");
-				}
-			}
-		}
-
-		return null;
-	}
+	// true = try the own-bots source, false = try the group-commenters source; these are fixed source tags, shuffled independently of which sources are actually enabled (checked by the caller)
+	private static IEnumerable<bool> ShuffledSourceTags() => new[] { true, false }.OrderBy(static _ => Random.Shared.Next());
 
 	private static Bot? PickOwnBotCandidate(Bot bot, List<Bot> onlineBots) => onlineBots.FirstOrDefault(otherBot => (otherBot != bot) && (otherBot.SteamID != 0) && (bot.SteamFriends.GetFriendRelationship(otherBot.SteamID) == EFriendRelationship.None));
 
@@ -273,20 +279,21 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 		return candidates.Count > 0 ? candidates[Random.Shared.Next(candidates.Count)] : null;
 	}
 
-	// SteamFriends.GetFriendCount() returns the size of the whole friend-list cache (pending, blocked, ignored, etc, not just accepted friends), so we need to filter it down ourselves
-	private static int GetActualFriendCount(Bot bot) {
+	// SteamFriends.GetFriendCount() returns the size of the whole friend-list cache (pending, blocked, ignored, etc), so we filter it down to what actually occupies a target slot:
+	// accepted friends, plus our own outstanding invites (RequestInitiator) so an unanswered invite still counts against the target instead of leaving it permanently "open"
+	private static int GetOccupiedFriendSlots(Bot bot) {
 		int cacheSize = bot.SteamFriends.GetFriendCount();
-		int friends = 0;
+		int occupiedSlots = 0;
 
 		for (int i = 0; i < cacheSize; i++) {
 			SteamID steamID = bot.SteamFriends.GetFriendByIndex(i);
 
-			if (bot.SteamFriends.GetFriendRelationship(steamID) == EFriendRelationship.Friend) {
-				friends++;
+			if (bot.SteamFriends.GetFriendRelationship(steamID) is EFriendRelationship.Friend or EFriendRelationship.RequestInitiator) {
+				occupiedSlots++;
 			}
 		}
 
-		return friends;
+		return occupiedSlots;
 	}
 
 	[GeneratedRegex("data-miniprofile=\"(\\d+)\"")]
