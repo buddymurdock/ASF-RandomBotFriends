@@ -29,6 +29,8 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	private const ushort DefaultMinDelayBetweenInvitesInSeconds = 30;
 	private const byte DefaultGroupCommentersMaxFriends = 3;
 	private const byte DefaultGroupCommentersMinFriends = 1;
+	private const byte DefaultGroupCommentersMaxScanIntervalHours = 28;
+	private const byte DefaultGroupCommentersMinScanIntervalHours = 20;
 	private const byte DefaultOwnBotsMaxFriends = 5;
 	private const byte DefaultOwnBotsMinFriends = 2;
 	private const byte MaxCommentsToScan = 100;
@@ -37,14 +39,23 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	private readonly ConcurrentDictionary<string, int> BotGroupCommentersTargets = new(StringComparer.Ordinal);
 	private readonly ConcurrentDictionary<string, int> BotOwnBotsTargets = new(StringComparer.Ordinal);
 
+	// Cached commenter pool per bot, refreshed only once every [GroupCommentersMinScanIntervalHours; GroupCommentersMaxScanIntervalHours]
+	// (re-rolled per bot after every scan) instead of on every invite tick - fetching the same group's comment wall every 30-90s forever
+	// would itself be a machine-detectable pattern, independent of anything about the friend invites it feeds
+	private readonly ConcurrentDictionary<string, List<ulong>> BotGroupCommentersCache = new(StringComparer.Ordinal);
+	private readonly ConcurrentDictionary<string, DateTime> BotGroupCommentersNextScanAt = new(StringComparer.Ordinal);
+
 	private CancellationTokenSource? BackgroundLoopCts;
 	private volatile bool CapacityWarningLogged;
 	private byte CommentsToScan = DefaultCommentsToScan;
 	private bool Enabled;
 	private byte GroupCommentersMaxFriends = DefaultGroupCommentersMaxFriends;
+	private byte GroupCommentersMaxScanIntervalHours = DefaultGroupCommentersMaxScanIntervalHours;
 	private byte GroupCommentersMinFriends = DefaultGroupCommentersMinFriends;
+	private byte GroupCommentersMinScanIntervalHours = DefaultGroupCommentersMinScanIntervalHours;
 
-	// At most one steamcommunity.com fetch per tick, regardless of how many bots TrySendSingleInviteAsync ends up checking; reset at the start of every tick
+	// At most one steamcommunity.com fetch per tick, regardless of how many bots' caches expired this tick; reset at the start of every tick.
+	// With per-bot caching this mostly matters when several bots' caches happen to expire in the same tick - spreads their rescans out instead of bursting
 	private bool GroupCommentersAttemptedThisTick;
 
 	private bool InviteGroupCommenters;
@@ -54,13 +65,20 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	private byte OwnBotsMaxFriends = DefaultOwnBotsMaxFriends;
 	private byte OwnBotsMinFriends = DefaultOwnBotsMinFriends;
 
+	// Extra groups to scan for commenters regardless of whether the bot is actually a member - e.g. dedicated
+	// "looking for friends" groups. Merged with the bot's own group memberships, not a replacement for them
+	private ulong[] GroupCommentersTargetGroupIDs = [];
+
 	public string Name => nameof(RandomBotFriends);
 	public string RepositoryName => "buddymurdock/ASF-RandomBotFriends";
 	public Version Version => typeof(RandomBotFriends).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
 	// Reads RandomBotFriendsEnabled / RandomBotFriendsMinDelayBetweenInvites / RandomBotFriendsMaxDelayBetweenInvites / RandomBotFriendsInviteOwnBots / RandomBotFriendsOwnBotsMinFriends /
-	// RandomBotFriendsOwnBotsMaxFriends / RandomBotFriendsInviteGroupCommenters / RandomBotFriendsGroupCommentersMinFriends / RandomBotFriendsGroupCommentersMaxFriends / RandomBotFriendsCommentsToScan from the global ASF.json config
+	// RandomBotFriendsOwnBotsMaxFriends / RandomBotFriendsInviteGroupCommenters / RandomBotFriendsGroupCommentersMinFriends / RandomBotFriendsGroupCommentersMaxFriends / RandomBotFriendsCommentsToScan /
+	// RandomBotFriendsGroupCommentersTargetGroupIDs / RandomBotFriendsGroupCommentersMinScanIntervalHours / RandomBotFriendsGroupCommentersMaxScanIntervalHours from the global ASF.json config
 	public Task OnASFInit(IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
+		HashSet<ulong> parsedTargetGroupIDs = [];
+
 		if (additionalConfigProperties != null) {
 			foreach ((string configProperty, JsonElement configValue) in additionalConfigProperties) {
 				switch (configProperty) {
@@ -104,12 +122,30 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 						CommentsToScan = commentsToScan;
 
 						break;
+					case $"{nameof(RandomBotFriends)}GroupCommentersTargetGroupIDs" when configValue.ValueKind == JsonValueKind.Array:
+						AddParsedGroupIDs(configValue, parsedTargetGroupIDs);
+
+						break;
+					case $"{nameof(RandomBotFriends)}GroupCommentersMinScanIntervalHours" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetByte(out byte groupCommentersMinScanIntervalHours) && (groupCommentersMinScanIntervalHours > 0):
+						GroupCommentersMinScanIntervalHours = groupCommentersMinScanIntervalHours;
+
+						break;
+					case $"{nameof(RandomBotFriends)}GroupCommentersMaxScanIntervalHours" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetByte(out byte groupCommentersMaxScanIntervalHours) && (groupCommentersMaxScanIntervalHours > 0):
+						GroupCommentersMaxScanIntervalHours = groupCommentersMaxScanIntervalHours;
+
+						break;
 				}
 			}
 		}
 
+		GroupCommentersTargetGroupIDs = [.. parsedTargetGroupIDs];
+
 		if (MinDelayBetweenInvitesInSeconds > MaxDelayBetweenInvitesInSeconds) {
 			(MinDelayBetweenInvitesInSeconds, MaxDelayBetweenInvitesInSeconds) = (MaxDelayBetweenInvitesInSeconds, MinDelayBetweenInvitesInSeconds);
+		}
+
+		if (GroupCommentersMinScanIntervalHours > GroupCommentersMaxScanIntervalHours) {
+			(GroupCommentersMinScanIntervalHours, GroupCommentersMaxScanIntervalHours) = (GroupCommentersMaxScanIntervalHours, GroupCommentersMinScanIntervalHours);
 		}
 
 		if (OwnBotsMinFriends > OwnBotsMaxFriends) {
@@ -136,7 +172,7 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			return Task.CompletedTask;
 		}
 
-		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, {MinDelayBetweenInvitesInSeconds}-{MaxDelayBetweenInvitesInSeconds}s between invites. Sources: {(InviteOwnBots ? $"own bots ({OwnBotsMinFriends}-{OwnBotsMaxFriends} friends/bot)" : null)}{((InviteOwnBots && InviteGroupCommenters) ? " + " : null)}{(InviteGroupCommenters ? $"group commenters ({GroupCommentersMinFriends}-{GroupCommentersMaxFriends} friends/bot, last {CommentsToScan} comments)" : null)}.");
+		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, {MinDelayBetweenInvitesInSeconds}-{MaxDelayBetweenInvitesInSeconds}s between invites. Sources: {(InviteOwnBots ? $"own bots ({OwnBotsMinFriends}-{OwnBotsMaxFriends} friends/bot)" : null)}{((InviteOwnBots && InviteGroupCommenters) ? " + " : null)}{(InviteGroupCommenters ? $"group commenters ({GroupCommentersMinFriends}-{GroupCommentersMaxFriends} friends/bot, rescanned every {GroupCommentersMinScanIntervalHours}-{GroupCommentersMaxScanIntervalHours}h, last {CommentsToScan} comments, {GroupCommentersTargetGroupIDs.Length} target group(s) + own memberships)" : null)}.");
 
 		if (BackgroundLoopCts != null) {
 			// OnASFInit() should only ever be called once per process, this is just a safety net against a possible double start
@@ -249,7 +285,7 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	}
 
 	private async Task<(ulong SteamID, string SourceLabel, int Occupied, int Target)?> TryGroupCommentersCandidateAsync(Bot bot, IReadOnlyDictionary<string, Bot> bots, HashSet<ulong> ownBotSteamIDs) {
-		if (!InviteGroupCommenters || GroupCommentersAttemptedThisTick) {
+		if (!InviteGroupCommenters) {
 			return null;
 		}
 
@@ -260,30 +296,77 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			return null;
 		}
 
-		GroupCommentersAttemptedThisTick = true;
-
 		ulong? commenterCandidate = await GetGroupCommenterCandidateAsync(bot, bots).ConfigureAwait(false);
 
 		return commenterCandidate != null ? (commenterCandidate.Value, "group commenter", occupied, target) : null;
 	}
 
-	// Picks a random group the bot is already a member of, pulls its most recent CommentsToScan wall comments, and returns a random commenter the bot isn't already related to
+	// The raw commenter pool is only (re)scanned once every [GroupCommentersMinScanIntervalHours; GroupCommentersMaxScanIntervalHours]
+	// per bot - re-rolled after every scan, so it's neither a fixed period nor "once a tick" - and cached in between. Only an actual
+	// cache miss counts against the once-per-tick fetch limit below; serving from an already-warm cache never touches steamcommunity.com
 	private async Task<ulong?> GetGroupCommenterCandidateAsync(Bot bot, IReadOnlyDictionary<string, Bot> bots) {
-		List<ulong> ownGroups = [];
+		List<ulong>? cachedCommenterIDs = BotGroupCommentersCache.GetValueOrDefault(bot.BotName);
+		bool cacheIsStale = !BotGroupCommentersNextScanAt.TryGetValue(bot.BotName, out DateTime nextScanAt) || (DateTime.UtcNow >= nextScanAt);
+
+		if (cacheIsStale) {
+			if (GroupCommentersAttemptedThisTick) {
+				// Another bot already used this tick's single steamcommunity.com fetch budget - fall back to whatever we have cached (possibly nothing) and try rescanning next tick
+				return PickLiveCandidate(bot, bots, cachedCommenterIDs);
+			}
+
+			GroupCommentersAttemptedThisTick = true;
+
+			List<ulong>? freshCommenterIDs = await ScanGroupCommentersAsync(bot).ConfigureAwait(false);
+
+			if (freshCommenterIDs != null) {
+				cachedCommenterIDs = freshCommenterIDs;
+				BotGroupCommentersCache[bot.BotName] = freshCommenterIDs;
+			}
+
+			int scanIntervalHours = GroupCommentersMinScanIntervalHours == GroupCommentersMaxScanIntervalHours ? GroupCommentersMinScanIntervalHours : Random.Shared.Next(GroupCommentersMinScanIntervalHours, GroupCommentersMaxScanIntervalHours + 1);
+			BotGroupCommentersNextScanAt[bot.BotName] = DateTime.UtcNow.AddHours(scanIntervalHours);
+		}
+
+		return PickLiveCandidate(bot, bots, cachedCommenterIDs);
+	}
+
+	// Re-checks relationships live (accepted friends/invites change between scans) and picks a random still-eligible commenter
+	private static ulong? PickLiveCandidate(Bot bot, IReadOnlyDictionary<string, Bot> bots, List<ulong>? commenterIDs) {
+		if ((commenterIDs == null) || (commenterIDs.Count == 0)) {
+			return null;
+		}
+
+		List<ulong> candidates = [
+			.. commenterIDs.Where(
+				steamID => (steamID != bot.SteamID) &&
+					!bots.Values.Any(otherBot => otherBot.SteamID == steamID) &&
+					(bot.SteamFriends.GetFriendRelationship(new SteamID(steamID)) == EFriendRelationship.None)
+			)
+		];
+
+		return candidates.Count > 0 ? candidates[Random.Shared.Next(candidates.Count)] : null;
+	}
+
+	// Picks a random group - either one the bot is already a member of, or one of the configured
+	// GroupCommentersTargetGroupIDs (those don't require membership, a public Steam group's comment wall
+	// is readable by anyone) - and pulls its most recent CommentsToScan wall comments
+	private async Task<List<ulong>?> ScanGroupCommentersAsync(Bot bot) {
+		HashSet<ulong> candidateGroupsSet = [.. GroupCommentersTargetGroupIDs];
 		int clanCount = bot.SteamFriends.GetClanCount();
 
 		for (int i = 0; i < clanCount; i++) {
 			SteamID clanID = bot.SteamFriends.GetClanByIndex(i);
 
 			if (bot.SteamFriends.GetClanRelationship(clanID) == EClanRelationship.Member) {
-				ownGroups.Add(clanID.ConvertToUInt64());
+				candidateGroupsSet.Add(clanID.ConvertToUInt64());
 			}
 		}
 
-		if (ownGroups.Count == 0) {
+		if (candidateGroupsSet.Count == 0) {
 			return null;
 		}
 
+		List<ulong> ownGroups = [.. candidateGroupsSet];
 		ulong groupID = ownGroups[Random.Shared.Next(ownGroups.Count)];
 
 		Uri request = new($"https://steamcommunity.com/comment/Clan/render/{groupID}/-1/?start=0&count={CommentsToScan}");
@@ -304,15 +387,23 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			}
 		}
 
-		List<ulong> candidates = [
-			.. commenterSteamIDs.Where(
-				steamID => (steamID != bot.SteamID) &&
-					!bots.Values.Any(otherBot => otherBot.SteamID == steamID) &&
-					(bot.SteamFriends.GetFriendRelationship(new SteamID(steamID)) == EFriendRelationship.None)
-			)
-		];
+		return [.. commenterSteamIDs];
+	}
 
-		return candidates.Count > 0 ? candidates[Random.Shared.Next(candidates.Count)] : null;
+	private static void AddParsedGroupIDs(JsonElement array, HashSet<ulong> target) {
+		foreach (JsonElement groupElement in array.EnumerateArray()) {
+			ulong? groupID = groupElement.ValueKind switch {
+				JsonValueKind.Number when groupElement.TryGetUInt64(out ulong numericID) => numericID,
+				JsonValueKind.String when ulong.TryParse(groupElement.GetString(), out ulong stringID) => stringID,
+				_ => null
+			};
+
+			if ((groupID is { } validGroupID) && (validGroupID != 0) && new SteamID(validGroupID).IsClanAccount) {
+				target.Add(validGroupID);
+			} else {
+				ASF.ArchiLogger.LogGenericWarning($"Ignoring invalid {nameof(RandomBotFriends)}GroupCommentersTargetGroupIDs entry: {groupElement}.");
+			}
+		}
 	}
 
 	// SteamFriends.GetFriendCount() returns the size of the whole friend-list cache (pending, blocked, ignored, etc), so we filter it down to what actually occupies a target slot:
