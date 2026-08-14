@@ -2,6 +2,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
@@ -24,6 +26,7 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	// SteamID64 = this + the 32-bit account ID Steam embeds in every comment's data-miniprofile attribute
 	private const ulong IndividualAccountIDBase = 76561197960265728UL;
 
+	private const byte DefaultClusterCount = 1;
 	private const byte DefaultCommentsToScan = 50;
 	private const ushort DefaultMaxDelayBetweenInvitesInSeconds = 90;
 	private const ushort DefaultMinDelayBetweenInvitesInSeconds = 30;
@@ -58,6 +61,7 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	// With per-bot caching this mostly matters when several bots' caches happen to expire in the same tick - spreads their rescans out instead of bursting
 	private bool GroupCommentersAttemptedThisTick;
 
+	private byte ClusterCount = DefaultClusterCount;
 	private bool InviteGroupCommenters;
 	private bool InviteOwnBots = true;
 	private ushort MaxDelayBetweenInvitesInSeconds = DefaultMaxDelayBetweenInvitesInSeconds;
@@ -74,8 +78,8 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 	public Version Version => typeof(RandomBotFriends).Assembly.GetName().Version ?? throw new InvalidOperationException(nameof(Version));
 
 	// Reads RandomBotFriendsEnabled / RandomBotFriendsMinDelayBetweenInvites / RandomBotFriendsMaxDelayBetweenInvites / RandomBotFriendsInviteOwnBots / RandomBotFriendsOwnBotsMinFriends /
-	// RandomBotFriendsOwnBotsMaxFriends / RandomBotFriendsInviteGroupCommenters / RandomBotFriendsGroupCommentersMinFriends / RandomBotFriendsGroupCommentersMaxFriends / RandomBotFriendsCommentsToScan /
-	// RandomBotFriendsGroupCommentersTargetGroupIDs / RandomBotFriendsGroupCommentersMinScanIntervalHours / RandomBotFriendsGroupCommentersMaxScanIntervalHours from the global ASF.json config
+	// RandomBotFriendsOwnBotsMaxFriends / RandomBotFriendsClusterCount / RandomBotFriendsInviteGroupCommenters / RandomBotFriendsGroupCommentersMinFriends / RandomBotFriendsGroupCommentersMaxFriends /
+	// RandomBotFriendsCommentsToScan / RandomBotFriendsGroupCommentersTargetGroupIDs / RandomBotFriendsGroupCommentersMinScanIntervalHours / RandomBotFriendsGroupCommentersMaxScanIntervalHours from the global ASF.json config
 	public Task OnASFInit(IReadOnlyDictionary<string, JsonElement>? additionalConfigProperties = null) {
 		HashSet<ulong> parsedTargetGroupIDs = [];
 
@@ -96,6 +100,10 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 						break;
 					case $"{nameof(RandomBotFriends)}InviteOwnBots" when configValue.ValueKind is JsonValueKind.True or JsonValueKind.False:
 						InviteOwnBots = configValue.GetBoolean();
+
+						break;
+					case $"{nameof(RandomBotFriends)}ClusterCount" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetByte(out byte clusterCount) && (clusterCount > 0):
+						ClusterCount = clusterCount;
 
 						break;
 					case $"{nameof(RandomBotFriends)}OwnBotsMinFriends" when (configValue.ValueKind == JsonValueKind.Number) && configValue.TryGetByte(out byte ownBotsMinFriends):
@@ -172,7 +180,7 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			return Task.CompletedTask;
 		}
 
-		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, {MinDelayBetweenInvitesInSeconds}-{MaxDelayBetweenInvitesInSeconds}s between invites. Sources: {(InviteOwnBots ? $"own bots ({OwnBotsMinFriends}-{OwnBotsMaxFriends} friends/bot)" : null)}{((InviteOwnBots && InviteGroupCommenters) ? " + " : null)}{(InviteGroupCommenters ? $"group commenters ({GroupCommentersMinFriends}-{GroupCommentersMaxFriends} friends/bot, rescanned every {GroupCommentersMinScanIntervalHours}-{GroupCommentersMaxScanIntervalHours}h, last {CommentsToScan} comments, {GroupCommentersTargetGroupIDs.Length} target group(s) + own memberships)" : null)}.");
+		ASF.ArchiLogger.LogGenericInfo($"{Name} is enabled, {MinDelayBetweenInvitesInSeconds}-{MaxDelayBetweenInvitesInSeconds}s between invites. Sources: {(InviteOwnBots ? $"own bots ({OwnBotsMinFriends}-{OwnBotsMaxFriends} friends/bot, split into {ClusterCount} cluster(s))" : null)}{((InviteOwnBots && InviteGroupCommenters) ? " + " : null)}{(InviteGroupCommenters ? $"group commenters ({GroupCommentersMinFriends}-{GroupCommentersMaxFriends} friends/bot, rescanned every {GroupCommentersMinScanIntervalHours}-{GroupCommentersMaxScanIntervalHours}h, last {CommentsToScan} comments, {GroupCommentersTargetGroupIDs.Length} target group(s) + own memberships)" : null)}.");
 
 		if (BackgroundLoopCts != null) {
 			// OnASFInit() should only ever be called once per process, this is just a safety net against a possible double start
@@ -269,16 +277,29 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 			return;
 		}
 
-		if (InviteOwnBots && !CapacityWarningLogged && (OwnBotsMinFriends > bots.Count - 1)) {
+		// This is an average, not an exact per-cluster figure - clusters aren't guaranteed to be evenly sized (hash-bucketed by bot name), so a
+		// bot in a smaller-than-average cluster could still be capacity-starved even when this check passes, and vice versa. It's a rough early
+		// warning, not a guarantee.
+		int approxOwnBotsCapacityPerCluster = Math.Max(0, (ClusterCount > 1) ? ((bots.Count / ClusterCount) - 1) : (bots.Count - 1));
+
+		if (InviteOwnBots && !CapacityWarningLogged && (OwnBotsMinFriends > approxOwnBotsCapacityPerCluster)) {
 			CapacityWarningLogged = true;
 
-			ASF.ArchiLogger.LogGenericWarning($"{nameof(RandomBotFriends)}OwnBotsMinFriends ({OwnBotsMinFriends}) is higher than the number of other bots available in this ASF instance ({bots.Count - 1}); some bots may never reach their target.");
+			ASF.ArchiLogger.LogGenericWarning($"{nameof(RandomBotFriends)}OwnBotsMinFriends ({OwnBotsMinFriends}) is higher than the approximate number of other bots available per cluster ({approxOwnBotsCapacityPerCluster}, {ClusterCount} cluster(s) over {bots.Count} bot(s)); some bots may never reach their target.");
 		}
 
 		List<Bot> onlineBots = [.. bots.Values.Where(static bot => bot.IsConnectedAndLoggedOn).OrderBy(static _ => Random.Shared.Next())];
 		HashSet<ulong> ownBotSteamIDs = [.. bots.Values.Select(static otherBot => otherBot.SteamID).Where(static steamID => steamID != 0)];
 
 		GroupCommentersAttemptedThisTick = false;
+
+		// Clusters only constrain who gets invited going forward - they don't retroactively touch friendships an earlier, unclustered run of this
+		// plugin (or a manual action) already made. Pruning is a separate, deliberate cleanup pass: at most one cross-cluster own-bot friend removed
+		// per tick, same "one relationship-changing action at a time" discipline as invites below - a sudden mass-unfriend burst would itself be a
+		// more obvious signal than the gradual drift it's meant to undo. Skips the invite attempt this tick when it acts, same reasoning.
+		if (InviteOwnBots && (ClusterCount > 1) && await TryPruneCrossClusterFriendAsync(onlineBots).ConfigureAwait(false)) {
+			return;
+		}
 
 		foreach (Bot bot in onlineBots) {
 			(ulong SteamID, string SourceLabel, int Occupied, int Target)? candidate;
@@ -314,7 +335,58 @@ internal sealed partial class RandomBotFriends : IASF, IGitHubPluginUpdates {
 		}
 	}
 
-	private static Bot? PickOwnBotCandidate(Bot bot, List<Bot> onlineBots) => onlineBots.FirstOrDefault(otherBot => (otherBot != bot) && (otherBot.SteamID != 0) && (bot.SteamFriends.GetFriendRelationship(otherBot.SteamID) == EFriendRelationship.None));
+	// Deterministic, stable across restarts and unrelated to how many bots currently exist - unlike string.GetHashCode() (randomized per
+	// process since .NET Core, would reshuffle every cluster on every comin-triggered restart) or a scheme keyed off the live bot count
+	// (would reshuffle everyone whenever the fleet grows/shrinks past a threshold). A bot's cluster only ever changes if ClusterCount itself
+	// is changed in config - a deliberate, rare operator action, not a side effect of an unrelated restart or a new bot being added elsewhere.
+	private static int GetClusterID(string botName, byte clusterCount) {
+		if (clusterCount <= 1) {
+			return 0;
+		}
+
+		byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes(botName));
+		uint value = BitConverter.ToUInt32(hash, 0);
+
+		return (int) (value % clusterCount);
+	}
+
+	private Bot? PickOwnBotCandidate(Bot bot, List<Bot> onlineBots) {
+		int botCluster = GetClusterID(bot.BotName, ClusterCount);
+
+		return onlineBots.FirstOrDefault(otherBot => (otherBot != bot) && (otherBot.SteamID != 0) && (GetClusterID(otherBot.BotName, ClusterCount) == botCluster) && (bot.SteamFriends.GetFriendRelationship(otherBot.SteamID) == EFriendRelationship.None));
+	}
+
+	// Finds at most one pair of own-bots that are still friends despite landing in different clusters under the current ClusterCount
+	// (either from before clustering was enabled, or from a config change that moved one of them to a different cluster) and unfriends
+	// them. Returns whether it actually removed one, so the caller can skip this tick's invite attempt when it did.
+	private async Task<bool> TryPruneCrossClusterFriendAsync(List<Bot> onlineBots) {
+		foreach (Bot bot in onlineBots) {
+			int botCluster = GetClusterID(bot.BotName, ClusterCount);
+
+			Bot? crossClusterFriend = onlineBots.FirstOrDefault(
+				otherBot => (otherBot != bot) &&
+					(otherBot.SteamID != 0) &&
+					(GetClusterID(otherBot.BotName, ClusterCount) != botCluster) &&
+					(bot.SteamFriends.GetFriendRelationship(otherBot.SteamID) == EFriendRelationship.Friend)
+			);
+
+			if (crossClusterFriend == null) {
+				continue;
+			}
+
+			bool success = await bot.ArchiHandler.RemoveFriend(crossClusterFriend.SteamID).ConfigureAwait(false);
+
+			if (success) {
+				bot.ArchiLogger.LogGenericInfo($"Unfriended {crossClusterFriend.SteamID} (own bot, cluster {GetClusterID(crossClusterFriend.BotName, ClusterCount)}) - outside this bot's cluster ({botCluster}).");
+			} else {
+				bot.ArchiLogger.LogGenericWarning($"Failed to unfriend {crossClusterFriend.SteamID} (own bot, outside this bot's cluster).");
+			}
+
+			return true;
+		}
+
+		return false;
+	}
 
 	private (ulong SteamID, string SourceLabel, int Occupied, int Target)? TryOwnBotsCandidate(Bot bot, List<Bot> onlineBots, HashSet<ulong> ownBotSteamIDs) {
 		if (!InviteOwnBots) {
